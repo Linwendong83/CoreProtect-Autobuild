@@ -1,0 +1,198 @@
+name: Build CoreProtect
+
+on:
+  schedule:
+    # GitHub cron uses UTC. This runs once per day.
+    - cron: "0 20 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_branch:
+        description: "CoreProtect branch to track"
+        required: false
+        default: "master"
+      project_branch:
+        description: "Value written to pom.xml <project.branch>"
+        required: false
+        default: "development"
+      force_build:
+        description: "Build even if this upstream commit already has a release"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: coreprotect-${{ github.event.inputs.upstream_branch || 'master' }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: PlayPro/CoreProtect
+  UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'master' }}
+  PROJECT_BRANCH: ${{ github.event.inputs.project_branch || 'development' }}
+  FORCE_BUILD: ${{ github.event.inputs.force_build || 'false' }}
+
+jobs:
+  build:
+    name: Build upstream commit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@v4
+
+      - name: Find latest upstream commit
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "refs/heads/${UPSTREAM_BRANCH}" | awk '{print $1}')"
+          if [[ -z "$sha" ]]; then
+            echo "Could not find ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}" >&2
+            exit 1
+          fi
+
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${sha:0:7}" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/${UPSTREAM_REPO}/commit/${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Check previous release
+        id: state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base_release_tag="coreprotect-${{ steps.upstream.outputs.sha }}"
+
+          if [[ "${FORCE_BUILD}" == "true" ]]; then
+            release_tag="${base_release_tag}-run-${GITHUB_RUN_NUMBER}"
+            echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Forced build requested for ${release_tag}."
+          elif gh release view "${base_release_tag}" >/dev/null 2>&1; then
+            echo "release_tag=${base_release_tag}" >> "$GITHUB_OUTPUT"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${base_release_tag} already exists. Nothing to build."
+          else
+            echo "release_tag=${base_release_tag}" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "No release found for ${base_release_tag}. Building."
+          fi
+
+      - name: Stop when no new commit exists
+        if: steps.state.outputs.should_build != 'true'
+        shell: bash
+        run: |
+          echo "CoreProtect ${{ steps.upstream.outputs.sha }} was already built."
+
+      - name: Clone CoreProtect
+        if: steps.state.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${UPSTREAM_BRANCH}" "https://github.com/${UPSTREAM_REPO}.git" coreprotect
+          actual_sha="$(git -C coreprotect rev-parse HEAD)"
+          if [[ "${actual_sha}" != "${{ steps.upstream.outputs.sha }}" ]]; then
+            echo "Expected ${{ steps.upstream.outputs.sha }}, got ${actual_sha}" >&2
+            exit 1
+          fi
+
+      - name: Set up JDK 25
+        if: steps.state.outputs.should_build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          java-version: "25"
+          distribution: temurin
+          cache: maven
+          cache-dependency-path: coreprotect/pom.xml
+
+      - name: Patch pom.xml project.branch
+        if: steps.state.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/set-project-branch.py coreprotect/pom.xml "${PROJECT_BRANCH}"
+          grep -n "<project.branch>${PROJECT_BRANCH}</project.branch>" coreprotect/pom.xml
+
+      - name: Build CoreProtect
+        if: steps.state.outputs.should_build == 'true'
+        working-directory: coreprotect
+        shell: bash
+        run: mvn -B verify
+
+      - name: Collect jars
+        if: steps.state.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-output
+          find coreprotect/target -maxdepth 1 -type f -name "*.jar" \
+            ! -name "original-*.jar" \
+            ! -name "*-sources.jar" \
+            ! -name "*-javadoc.jar" \
+            -print0 | while IFS= read -r -d '' jar; do
+              cp "$jar" build-output/
+            done
+
+          if ! compgen -G "build-output/*.jar" >/dev/null; then
+            echo "No jar files were produced in coreprotect/target." >&2
+            exit 1
+          fi
+
+          ls -lh build-output
+
+      - name: Prepare release metadata
+        if: steps.state.outputs.should_build == 'true'
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("coreprotect/pom.xml").getroot()
+          ns = ""
+          if root.tag.startswith("{"):
+              ns = root.tag[1:].split("}", 1)[0]
+
+          def q(name):
+              return f"{{{ns}}}{name}" if ns else name
+
+          version = root.findtext(q("version"))
+          if not version:
+              parent = root.find(q("parent"))
+              version = parent.findtext(q("version")) if parent is not None else ""
+
+          if not version:
+              raise SystemExit("Could not find project version in coreprotect/pom.xml")
+
+          print(version.strip())
+          PY
+          )"
+          echo "title=CoreProtect v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        if: steps.state.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coreprotect-${{ steps.upstream.outputs.short_sha }}
+          path: build-output/*.jar
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        if: steps.state.outputs.should_build == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          : > "${notes}"
+
+          gh release create "${{ steps.state.outputs.release_tag }}" build-output/*.jar \
+            --title "${{ steps.release.outputs.title }}" \
+            --notes-file "${notes}" \
+            --target "${GITHUB_SHA}"
