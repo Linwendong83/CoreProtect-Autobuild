@@ -92,7 +92,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "${UPSTREAM_BRANCH}" "https://github.com/${UPSTREAM_REPO}.git" coreprotect
+          git clone --branch "${UPSTREAM_BRANCH}" "https://github.com/${UPSTREAM_REPO}.git" coreprotect
           actual_sha="$(git -C coreprotect rev-parse HEAD)"
           if [[ "${actual_sha}" != "${{ steps.upstream.outputs.sha }}" ]]; then
             echo "Expected ${{ steps.upstream.outputs.sha }}, got ${actual_sha}" >&2
@@ -182,6 +182,26 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Generate release notes
+        if: steps.state.outputs.should_build == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release list --limit 100 --json tagName,publishedAt,createdAt > releases.json
+          python3 scripts/generate-release-notes.py \
+            --coreprotect-dir coreprotect \
+            --releases-json releases.json \
+            --upstream-repo "${UPSTREAM_REPO}" \
+            --upstream-branch "${UPSTREAM_BRANCH}" \
+            --current-sha "${{ steps.upstream.outputs.sha }}" \
+            --project-branch "${PROJECT_BRANCH}" \
+            --current-release-tag "${{ steps.state.outputs.release_tag }}" \
+            --output release-notes.md
+
+          cat release-notes.md
+
       - name: Publish GitHub release
         if: steps.state.outputs.should_build == 'true'
         shell: bash
@@ -189,10 +209,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          notes="$(mktemp)"
-          : > "${notes}"
-
           gh release create "${{ steps.state.outputs.release_tag }}" build-output/*.jar \
             --title "${{ steps.release.outputs.title }}" \
-            --notes-file "${notes}" \
+            --notes-file release-notes.md \
             --target "${GITHUB_SHA}"
