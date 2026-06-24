@@ -99,8 +99,37 @@ jobs:
             exit 1
           fi
 
-      - name: Set up JDK 25
+      - name: Fetch release history
         if: steps.state.outputs.should_build == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release list --limit 100 --json tagName,publishedAt,createdAt > releases.json
+
+      - name: Check whether upstream changes need a build
+        if: steps.state.outputs.should_build == 'true'
+        id: upstream_filter
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/check-upstream-build-needed.py \
+            --coreprotect-dir coreprotect \
+            --releases-json releases.json \
+            --current-sha "${{ steps.upstream.outputs.sha }}" \
+            --current-release-tag "${{ steps.state.outputs.release_tag }}" \
+            --force-build "${FORCE_BUILD}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Stop when upstream changes do not need a build
+        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build != 'true'
+        shell: bash
+        run: |
+          echo "${{ steps.upstream_filter.outputs.reason }}"
+
+      - name: Set up JDK 25
+        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
         uses: actions/setup-java@v4
         with:
           java-version: "25"
@@ -109,7 +138,7 @@ jobs:
           cache-dependency-path: coreprotect/pom.xml
 
       - name: Patch pom.xml project.branch
-        if: steps.state.outputs.should_build == 'true'
+        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -117,13 +146,13 @@ jobs:
           grep -n "<project.branch>${PROJECT_BRANCH}</project.branch>" coreprotect/pom.xml
 
       - name: Build CoreProtect
-        if: steps.state.outputs.should_build == 'true'
+        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
         working-directory: coreprotect
         shell: bash
         run: mvn -B verify
 
       - name: Collect jars
-        if: steps.state.outputs.should_build == 'true'
+        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -144,7 +173,7 @@ jobs:
           ls -lh build-output
 
       - name: Prepare release metadata
-        if: steps.state.outputs.should_build == 'true'
+        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
         id: release
         shell: bash
         run: |
@@ -174,7 +203,7 @@ jobs:
           echo "title=CoreProtect v${version}" >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow artifact
-        if: steps.state.outputs.should_build == 'true'
+        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: coreprotect-${{ steps.upstream.outputs.short_sha }}
@@ -183,13 +212,10 @@ jobs:
           retention-days: 30
 
       - name: Generate release notes
-        if: steps.state.outputs.should_build == 'true'
+        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release list --limit 100 --json tagName,publishedAt,createdAt > releases.json
           python3 scripts/generate-release-notes.py \
             --coreprotect-dir coreprotect \
             --releases-json releases.json \
@@ -203,7 +229,7 @@ jobs:
           cat release-notes.md
 
       - name: Publish GitHub release
-        if: steps.state.outputs.should_build == 'true'
+        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
