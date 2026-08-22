@@ -185,53 +185,35 @@ def linked_commit(upstream_repo: str, sha: str, short_sha: str | None = None) ->
     return f"[`{label}`]({commit_url(upstream_repo, sha)})"
 
 
-def choose_commits(repo: Path, current_sha: str, previous_sha: str | None) -> tuple[list[Commit], str]:
-    if not previous_sha:
-        return read_commits(repo, "--max-count=1", current_sha), (
-            "首次发布：未找到可比较的上一次自动构建提交；下面仅列出当前构建提交。"
-        )
+def choose_commits(repo: Path, current_sha: str, previous_sha: str | None) -> list[Commit]:
+    if not previous_sha or previous_sha == current_sha:
+        return read_commits(repo, "--max-count=1", current_sha)
 
-    if previous_sha == current_sha:
-        return [], "本次没有新增上游 commit；这是对同一上游 SHA 的重新构建。"
-
-    if not commit_exists(repo, previous_sha):
-        return read_commits(repo, "--max-count=1", current_sha), (
-            "未能在当前上游分支历史中找到上一次构建的 SHA；"
-            "可能是上游历史被改写或比较基准不在当前分支，下面仅列出当前构建提交。"
-        )
-
-    if not is_ancestor(repo, previous_sha, current_sha):
-        return read_commits(repo, "--max-count=1", current_sha), (
-            "上一次构建的 SHA 不是当前上游 SHA 的祖先；"
-            "可能是上游历史被改写或切换了分支，下面仅列出当前构建提交。"
-        )
+    if not commit_exists(repo, previous_sha) or not is_ancestor(repo, previous_sha, current_sha):
+        return read_commits(repo, "--max-count=1", current_sha)
 
     commits = read_commits(repo, f"{previous_sha}..{current_sha}")
     if not commits:
-        return [], "本次没有新增上游 commit。"
+        return read_commits(repo, "--max-count=1", current_sha)
 
-    return commits, f"以下为自上一次自动构建以来新增的 {len(commits)} 个上游 commit。"
+    return commits
 
 
 def render_notes(
     upstream_repo: str,
     current_sha: str,
     commits: list[Commit],
-    summary: str,
 ) -> str:
     lines = [
         "## 上游新增补丁",
         "",
-        summary,
     ]
 
-    if commits:
-        lines.append("")
-        for commit in commits:
-            lines.append(
-                f"- {linked_commit(upstream_repo, commit.sha, commit.short_sha)} "
-                f"{commit.subject} - {commit.author}, {commit.date}"
-            )
+    for commit in commits:
+        lines.append(
+            f"- {linked_commit(upstream_repo, commit.sha, commit.short_sha)} "
+            f"{commit.subject} - {commit.author}, {commit.date}"
+        )
 
     lines.extend(["", f"<!-- upstream_sha: {current_sha} -->", ""])
     return "\n".join(lines)
@@ -266,12 +248,11 @@ def main() -> int:
         releases_json=args.releases_json,
         current_release_tag=args.current_release_tag,
     )
-    commits, summary = choose_commits(args.coreprotect_dir, current_sha, previous_sha)
+    commits = choose_commits(args.coreprotect_dir, current_sha, previous_sha)
     notes = render_notes(
         upstream_repo=args.upstream_repo,
         current_sha=current_sha,
         commits=commits,
-        summary=summary,
     )
 
     args.output.write_text(notes, encoding="utf-8")
