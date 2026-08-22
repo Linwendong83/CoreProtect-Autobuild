@@ -215,31 +215,15 @@ def choose_commits(repo: Path, current_sha: str, previous_sha: str | None) -> tu
 
 def render_notes(
     upstream_repo: str,
-    upstream_branch: str,
     current_sha: str,
-    project_branch: str,
-    previous_sha: str | None,
     commits: list[Commit],
     summary: str,
 ) -> str:
-    current_short_sha = current_sha[:7]
     lines = [
-        f"本次构建来源：{linked_commit(upstream_repo, current_sha, current_short_sha)}",
+        "## 上游新增补丁",
         "",
-        f"- 上游仓库：`{upstream_repo}`",
-        f"- 上游分支：`{upstream_branch}`",
-        f"- 上游提交：{linked_commit(upstream_repo, current_sha, current_short_sha)}",
-        f"- project.branch：`{project_branch}`",
+        summary,
     ]
-
-    if not previous_sha:
-        lines.append("- 上一次构建提交：未找到")
-    else:
-        lines.append(
-            f"- 上一次构建提交：{linked_commit(upstream_repo, previous_sha)}"
-        )
-
-    lines.extend(["", "## 上游新增补丁", "", summary])
 
     if commits:
         lines.append("")
@@ -259,10 +243,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--release-json", type=Path)
     parser.add_argument("--releases-json", type=Path)
     parser.add_argument("--upstream-repo", required=True)
-    parser.add_argument("--upstream-branch", required=True)
+    parser.add_argument("--upstream-branch", default="master")
     parser.add_argument("--current-sha", required=True)
     parser.add_argument("--previous-sha")
-    parser.add_argument("--project-branch", required=True)
+    parser.add_argument("--project-branch", default="development")
     parser.add_argument("--current-release-tag")
     parser.add_argument("--output", required=True, type=Path)
     return parser.parse_args()
@@ -285,10 +269,7 @@ def main() -> int:
     commits, summary = choose_commits(args.coreprotect_dir, current_sha, previous_sha)
     notes = render_notes(
         upstream_repo=args.upstream_repo,
-        upstream_branch=args.upstream_branch,
         current_sha=current_sha,
-        project_branch=args.project_branch,
-        previous_sha=previous_sha,
         commits=commits,
         summary=summary,
     )
