@@ -82,10 +82,37 @@ def read_commits(repo: Path, *revision_args: str) -> list[Commit]:
     return [parse_commit_line(line) for line in lines]
 
 
+def string_value(item: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def extract_sha_from_text(text: str | None) -> str | None:
+    if not text:
+        return None
+
+    match = re.search(r"<!--\s*upstream_sha:\s*([0-9a-fA-F]{40})\s*-->", text)
+    if match:
+        return match.group(1).lower()
+
+    match = re.search(r"/commit/([0-9a-fA-F]{40})", text)
+    if match:
+        return match.group(1).lower()
+
+    match = re.search(r"coreprotect-([0-9a-fA-F]{40})", text)
+    if match:
+        return match.group(1).lower()
+
+    return None
+
+
 def load_releases(path: Path, current_release_tag: str | None) -> list[Release]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
-        raise SystemExit("Release JSON must be an array")
+        return []
 
     releases: list[Release] = []
     for index, item in enumerate(raw):
@@ -97,20 +124,55 @@ def load_releases(path: Path, current_release_tag: str | None) -> list[Release]:
             continue
 
         match = TAG_RE.fullmatch(tag)
-        if not match:
+        sha = match.group(1).lower() if match else extract_sha_from_text(string_value(item, "body"))
+        if not sha:
             continue
 
         date = string_value(item, "publishedAt", "published_at", "createdAt", "created_at") or ""
-        releases.append(Release(index=index, tag=tag, sha=match.group(1).lower(), date=date))
+        releases.append(Release(index=index, tag=tag, sha=sha, date=date))
 
     return sorted(releases, key=lambda release: (release.date, -release.index), reverse=True)
 
 
-def string_value(item: dict[str, Any], *keys: str) -> str | None:
-    for key in keys:
-        value = item.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+def get_previous_sha(
+    release_json: Path | None,
+    previous_sha: str | None,
+    releases_json: Path | None = None,
+    current_release_tag: str | None = None,
+) -> str | None:
+    if previous_sha and previous_sha.strip():
+        return previous_sha.strip().lower()
+
+    if release_json and release_json.is_file():
+        try:
+            content = release_json.read_text(encoding="utf-8").strip()
+            if content:
+                data = json.loads(content)
+                if isinstance(data, dict):
+                    body = data.get("body") or ""
+                    tag = data.get("tagName") or data.get("tag_name") or ""
+                    sha = extract_sha_from_text(body) or extract_sha_from_text(tag)
+                    if sha:
+                        return sha
+                elif isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict):
+                            body = item.get("body") or ""
+                            tag = item.get("tagName") or item.get("tag_name") or ""
+                            sha = extract_sha_from_text(body) or extract_sha_from_text(tag)
+                            if sha:
+                                return sha
+        except Exception:
+            pass
+
+    if releases_json and releases_json.is_file():
+        try:
+            releases = load_releases(releases_json, current_release_tag)
+            if releases:
+                return releases[0].sha
+        except Exception:
+            pass
+
     return None
 
 
@@ -123,28 +185,28 @@ def linked_commit(upstream_repo: str, sha: str, short_sha: str | None = None) ->
     return f"[`{label}`]({commit_url(upstream_repo, sha)})"
 
 
-def choose_commits(repo: Path, current_sha: str, previous: Release | None) -> tuple[list[Commit], str]:
-    if previous is None:
+def choose_commits(repo: Path, current_sha: str, previous_sha: str | None) -> tuple[list[Commit], str]:
+    if not previous_sha:
         return read_commits(repo, "--max-count=1", current_sha), (
-            "首次发布：未找到可比较的上一次自动构建 Release；下面仅列出当前构建提交。"
+            "首次发布：未找到可比较的上一次自动构建提交；下面仅列出当前构建提交。"
         )
 
-    if previous.sha == current_sha:
+    if previous_sha == current_sha:
         return [], "本次没有新增上游 commit；这是对同一上游 SHA 的重新构建。"
 
-    if not commit_exists(repo, previous.sha):
+    if not commit_exists(repo, previous_sha):
         return read_commits(repo, "--max-count=1", current_sha), (
-            "未能在当前上游分支历史中找到上一次 Release 的 SHA；"
+            "未能在当前上游分支历史中找到上一次构建的 SHA；"
             "可能是上游历史被改写或比较基准不在当前分支，下面仅列出当前构建提交。"
         )
 
-    if not is_ancestor(repo, previous.sha, current_sha):
+    if not is_ancestor(repo, previous_sha, current_sha):
         return read_commits(repo, "--max-count=1", current_sha), (
-            "上一次 Release 的 SHA 不是当前上游 SHA 的祖先；"
+            "上一次构建的 SHA 不是当前上游 SHA 的祖先；"
             "可能是上游历史被改写或切换了分支，下面仅列出当前构建提交。"
         )
 
-    commits = read_commits(repo, f"{previous.sha}..{current_sha}")
+    commits = read_commits(repo, f"{previous_sha}..{current_sha}")
     if not commits:
         return [], "本次没有新增上游 commit。"
 
@@ -156,7 +218,7 @@ def render_notes(
     upstream_branch: str,
     current_sha: str,
     project_branch: str,
-    previous: Release | None,
+    previous_sha: str | None,
     commits: list[Commit],
     summary: str,
 ) -> str:
@@ -170,12 +232,11 @@ def render_notes(
         f"- project.branch：`{project_branch}`",
     ]
 
-    if previous is None:
-        lines.append("- 上一次自动构建：未找到")
+    if not previous_sha:
+        lines.append("- 上一次构建提交：未找到")
     else:
         lines.append(
-            f"- 上一次自动构建：`{previous.tag}` "
-            f"({linked_commit(upstream_repo, previous.sha)})"
+            f"- 上一次构建提交：{linked_commit(upstream_repo, previous_sha)}"
         )
 
     lines.extend(["", "## 上游新增补丁", "", summary])
@@ -188,17 +249,19 @@ def render_notes(
                 f"{commit.subject} - {commit.author}, {commit.date}"
             )
 
-    lines.append("")
+    lines.extend(["", f"<!-- upstream_sha: {current_sha} -->", ""])
     return "\n".join(lines)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--coreprotect-dir", required=True, type=Path)
-    parser.add_argument("--releases-json", required=True, type=Path)
+    parser.add_argument("--release-json", type=Path)
+    parser.add_argument("--releases-json", type=Path)
     parser.add_argument("--upstream-repo", required=True)
     parser.add_argument("--upstream-branch", required=True)
     parser.add_argument("--current-sha", required=True)
+    parser.add_argument("--previous-sha")
     parser.add_argument("--project-branch", required=True)
     parser.add_argument("--current-release-tag")
     parser.add_argument("--output", required=True, type=Path)
@@ -213,15 +276,19 @@ def main() -> int:
         print(f"Current SHA {current_sha} does not exist in {args.coreprotect_dir}", file=sys.stderr)
         return 1
 
-    releases = load_releases(args.releases_json, args.current_release_tag)
-    previous = releases[0] if releases else None
-    commits, summary = choose_commits(args.coreprotect_dir, current_sha, previous)
+    previous_sha = get_previous_sha(
+        release_json=args.release_json,
+        previous_sha=args.previous_sha,
+        releases_json=args.releases_json,
+        current_release_tag=args.current_release_tag,
+    )
+    commits, summary = choose_commits(args.coreprotect_dir, current_sha, previous_sha)
     notes = render_notes(
         upstream_repo=args.upstream_repo,
         upstream_branch=args.upstream_branch,
         current_sha=current_sha,
         project_branch=args.project_branch,
-        previous=previous,
+        previous_sha=previous_sha,
         commits=commits,
         summary=summary,
     )

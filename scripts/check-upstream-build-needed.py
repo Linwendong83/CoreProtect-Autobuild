@@ -65,10 +65,29 @@ def string_value(item: dict[str, Any], *keys: str) -> str | None:
     return None
 
 
+def extract_sha_from_text(text: str | None) -> str | None:
+    if not text:
+        return None
+
+    match = re.search(r"<!--\s*upstream_sha:\s*([0-9a-fA-F]{40})\s*-->", text)
+    if match:
+        return match.group(1).lower()
+
+    match = re.search(r"/commit/([0-9a-fA-F]{40})", text)
+    if match:
+        return match.group(1).lower()
+
+    match = re.search(r"coreprotect-([0-9a-fA-F]{40})", text)
+    if match:
+        return match.group(1).lower()
+
+    return None
+
+
 def load_releases(path: Path, current_release_tag: str | None) -> list[Release]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
-        raise SystemExit("Release JSON must be an array")
+        return []
 
     releases: list[Release] = []
     for index, item in enumerate(raw):
@@ -80,13 +99,56 @@ def load_releases(path: Path, current_release_tag: str | None) -> list[Release]:
             continue
 
         match = TAG_RE.fullmatch(tag)
-        if not match:
+        sha = match.group(1).lower() if match else extract_sha_from_text(string_value(item, "body"))
+        if not sha:
             continue
 
         date = string_value(item, "publishedAt", "published_at", "createdAt", "created_at") or ""
-        releases.append(Release(index=index, tag=tag, sha=match.group(1).lower(), date=date))
+        releases.append(Release(index=index, tag=tag, sha=sha, date=date))
 
     return sorted(releases, key=lambda release: (release.date, -release.index), reverse=True)
+
+
+def get_previous_sha(
+    release_json: Path | None,
+    previous_sha: str | None,
+    releases_json: Path | None = None,
+    current_release_tag: str | None = None,
+) -> str | None:
+    if previous_sha and previous_sha.strip():
+        return previous_sha.strip().lower()
+
+    if release_json and release_json.is_file():
+        try:
+            content = release_json.read_text(encoding="utf-8").strip()
+            if content:
+                data = json.loads(content)
+                if isinstance(data, dict):
+                    body = data.get("body") or ""
+                    tag = data.get("tagName") or data.get("tag_name") or ""
+                    sha = extract_sha_from_text(body) or extract_sha_from_text(tag)
+                    if sha:
+                        return sha
+                elif isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict):
+                            body = item.get("body") or ""
+                            tag = item.get("tagName") or item.get("tag_name") or ""
+                            sha = extract_sha_from_text(body) or extract_sha_from_text(tag)
+                            if sha:
+                                return sha
+        except Exception:
+            pass
+
+    if releases_json and releases_json.is_file():
+        try:
+            releases = load_releases(releases_json, current_release_tag)
+            if releases:
+                return releases[0].sha
+        except Exception:
+            pass
+
+    return None
 
 
 def changed_files(repo: Path, old_sha: str, new_sha: str) -> list[str]:
@@ -133,8 +195,10 @@ def write_outputs(path: Path | None, outputs: dict[str, str]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--coreprotect-dir", required=True, type=Path)
-    parser.add_argument("--releases-json", required=True, type=Path)
+    parser.add_argument("--release-json", type=Path)
+    parser.add_argument("--releases-json", type=Path)
     parser.add_argument("--current-sha", required=True)
+    parser.add_argument("--previous-sha")
     parser.add_argument("--current-release-tag")
     parser.add_argument("--force-build", default="false")
     parser.add_argument("--github-output", type=Path)
@@ -155,37 +219,42 @@ def main() -> int:
     if not commit_exists(args.coreprotect_dir, current_sha):
         raise SystemExit(f"Current SHA {current_sha} does not exist in {args.coreprotect_dir}")
 
-    releases = load_releases(args.releases_json, args.current_release_tag)
-    previous = releases[0] if releases else None
-    if previous is None:
+    previous_sha = get_previous_sha(
+        release_json=args.release_json,
+        previous_sha=args.previous_sha,
+        releases_json=args.releases_json,
+        current_release_tag=args.current_release_tag,
+    )
+
+    if previous_sha is None:
         write_outputs(args.github_output, {
             "should_build": "true",
             "reason": "No previous autobuild release found.",
         })
         return 0
 
-    if previous.sha == current_sha:
+    if previous_sha == current_sha:
         write_outputs(args.github_output, {
             "should_build": "false",
             "reason": f"Latest autobuild release already targets {current_sha[:7]}.",
         })
         return 0
 
-    if not commit_exists(args.coreprotect_dir, previous.sha):
+    if not commit_exists(args.coreprotect_dir, previous_sha):
         write_outputs(args.github_output, {
             "should_build": "true",
-            "reason": f"Previous release commit {previous.sha[:7]} is not in the current branch history.",
+            "reason": f"Previous release commit {previous_sha[:7]} is not in the current branch history.",
         })
         return 0
 
-    if not is_ancestor(args.coreprotect_dir, previous.sha, current_sha):
+    if not is_ancestor(args.coreprotect_dir, previous_sha, current_sha):
         write_outputs(args.github_output, {
             "should_build": "true",
-            "reason": f"Previous release commit {previous.sha[:7]} is not an ancestor of {current_sha[:7]}.",
+            "reason": f"Previous release commit {previous_sha[:7]} is not an ancestor of {current_sha[:7]}.",
         })
         return 0
 
-    paths = changed_files(args.coreprotect_dir, previous.sha, current_sha)
+    paths = changed_files(args.coreprotect_dir, previous_sha, current_sha)
     build_paths = [path for path in paths if not is_ignored_path(path)]
     if build_paths:
         write_outputs(args.github_output, {

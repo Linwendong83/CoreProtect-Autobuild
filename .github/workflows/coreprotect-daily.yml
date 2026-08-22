@@ -32,6 +32,7 @@ env:
   UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'master' }}
   PROJECT_BRANCH: ${{ github.event.inputs.project_branch || 'development' }}
   FORCE_BUILD: ${{ github.event.inputs.force_build || 'false' }}
+  RELEASE_TAG: latest
 
 jobs:
   build:
@@ -57,38 +58,23 @@ jobs:
           echo "short_sha=${sha:0:7}" >> "$GITHUB_OUTPUT"
           echo "url=https://github.com/${UPSTREAM_REPO}/commit/${sha}" >> "$GITHUB_OUTPUT"
 
-      - name: Check previous release
+      - name: Fetch previous release info
         id: state
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          base_release_tag="coreprotect-${{ steps.upstream.outputs.sha }}"
-
-          if [[ "${FORCE_BUILD}" == "true" ]]; then
-            release_tag="${base_release_tag}-run-${GITHUB_RUN_NUMBER}"
-            echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "Forced build requested for ${release_tag}."
-          elif gh release view "${base_release_tag}" >/dev/null 2>&1; then
-            echo "release_tag=${base_release_tag}" >> "$GITHUB_OUTPUT"
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-            echo "Release ${base_release_tag} already exists. Nothing to build."
+          if gh release view "${RELEASE_TAG}" --json tagName,body,publishedAt > previous-release.json 2>/dev/null; then
+            echo "found_release=true" >> "$GITHUB_OUTPUT"
+            echo "Existing ${RELEASE_TAG} release found."
           else
-            echo "release_tag=${base_release_tag}" >> "$GITHUB_OUTPUT"
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "No release found for ${base_release_tag}. Building."
+            echo "found_release=false" >> "$GITHUB_OUTPUT"
+            echo "{}" > previous-release.json
+            echo "No existing ${RELEASE_TAG} release found."
           fi
 
-      - name: Stop when no new commit exists
-        if: steps.state.outputs.should_build != 'true'
-        shell: bash
-        run: |
-          echo "CoreProtect ${{ steps.upstream.outputs.sha }} was already built."
-
       - name: Clone CoreProtect
-        if: steps.state.outputs.should_build == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -99,37 +85,26 @@ jobs:
             exit 1
           fi
 
-      - name: Fetch release history
-        if: steps.state.outputs.should_build == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release list --limit 100 --json tagName,publishedAt,createdAt > releases.json
-
       - name: Check whether upstream changes need a build
-        if: steps.state.outputs.should_build == 'true'
         id: upstream_filter
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/check-upstream-build-needed.py \
             --coreprotect-dir coreprotect \
-            --releases-json releases.json \
+            --release-json previous-release.json \
             --current-sha "${{ steps.upstream.outputs.sha }}" \
-            --current-release-tag "${{ steps.state.outputs.release_tag }}" \
             --force-build "${FORCE_BUILD}" \
             --github-output "${GITHUB_OUTPUT}"
 
       - name: Stop when upstream changes do not need a build
-        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build != 'true'
+        if: steps.upstream_filter.outputs.should_build != 'true'
         shell: bash
         run: |
           echo "${{ steps.upstream_filter.outputs.reason }}"
 
       - name: Set up JDK 25
-        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
+        if: steps.upstream_filter.outputs.should_build == 'true'
         uses: actions/setup-java@v4
         with:
           java-version: "25"
@@ -138,7 +113,7 @@ jobs:
           cache-dependency-path: coreprotect/pom.xml
 
       - name: Patch pom.xml project.branch
-        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
+        if: steps.upstream_filter.outputs.should_build == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -146,13 +121,13 @@ jobs:
           grep -n "<project.branch>${PROJECT_BRANCH}</project.branch>" coreprotect/pom.xml
 
       - name: Build CoreProtect
-        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
+        if: steps.upstream_filter.outputs.should_build == 'true'
         working-directory: coreprotect
         shell: bash
         run: mvn -B verify
 
       - name: Collect jars
-        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
+        if: steps.upstream_filter.outputs.should_build == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -173,7 +148,7 @@ jobs:
           ls -lh build-output
 
       - name: Prepare release metadata
-        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
+        if: steps.upstream_filter.outputs.should_build == 'true'
         id: release
         shell: bash
         run: |
@@ -203,7 +178,7 @@ jobs:
           echo "title=CoreProtect v${version}" >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow artifact
-        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
+        if: steps.upstream_filter.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: coreprotect-${{ steps.upstream.outputs.short_sha }}
@@ -212,30 +187,46 @@ jobs:
           retention-days: 30
 
       - name: Generate release notes
-        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
+        if: steps.upstream_filter.outputs.should_build == 'true'
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/generate-release-notes.py \
             --coreprotect-dir coreprotect \
-            --releases-json releases.json \
+            --release-json previous-release.json \
             --upstream-repo "${UPSTREAM_REPO}" \
             --upstream-branch "${UPSTREAM_BRANCH}" \
             --current-sha "${{ steps.upstream.outputs.sha }}" \
             --project-branch "${PROJECT_BRANCH}" \
-            --current-release-tag "${{ steps.state.outputs.release_tag }}" \
             --output release-notes.md
 
           cat release-notes.md
 
-      - name: Publish GitHub release
-        if: steps.state.outputs.should_build == 'true' && steps.upstream_filter.outputs.should_build == 'true'
+      - name: Publish or update GitHub release
+        if: steps.upstream_filter.outputs.should_build == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "${{ steps.state.outputs.release_tag }}" build-output/*.jar \
-            --title "${{ steps.release.outputs.title }}" \
-            --notes-file release-notes.md \
-            --target "${GITHUB_SHA}"
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Updating existing release ${RELEASE_TAG}..."
+            for asset in $(gh release view "${RELEASE_TAG}" --json assets -q '.assets[].name' 2>/dev/null || true); do
+              if [[ -n "$asset" ]]; then
+                echo "Removing old asset $asset"
+                gh release delete-asset "${RELEASE_TAG}" "$asset" -y || true
+              fi
+            done
+            gh release upload "${RELEASE_TAG}" build-output/*.jar --clobber
+            gh release edit "${RELEASE_TAG}" \
+              --title "${{ steps.release.outputs.title }}" \
+              --notes-file release-notes.md \
+              --latest
+          else
+            echo "Creating release ${RELEASE_TAG}..."
+            gh release create "${RELEASE_TAG}" build-output/*.jar \
+              --title "${{ steps.release.outputs.title }}" \
+              --notes-file release-notes.md \
+              --latest \
+              --target "${GITHUB_SHA}"
+          fi
